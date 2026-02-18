@@ -6,6 +6,15 @@ const os = require('os');
 
 const DB_PATH = path.join(os.homedir(), 'clawd', 'comms.db');
 const VALID_AGENTS = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter', 'connor'];
+const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
+const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || (() => {
+  try {
+    const envFile = require('fs').readFileSync(path.join(os.homedir(), '.openclaw', '.env'), 'utf8');
+    const match = envFile.match(/OPENCLAW_GATEWAY_TOKEN=(.+)/);
+    return match ? match[1].trim() : '';
+  } catch { return ''; }
+})();
+const AGENT_IDS = { orion: 'orion', devin: 'devin', scout: 'scout', quinn: 'quinn', porter: 'porter' };
 
 function getDb() {
   const db = new Database(DB_PATH);
@@ -35,6 +44,68 @@ function parseArgs(args) {
 function output(ok, data, summary) {
   console.log(JSON.stringify({ ok, data, summary }));
   if (summary) process.stderr.write(summary + '\n');
+}
+
+// Wake agents by scheduling one-shot cron jobs via the OpenClaw gateway
+async function wakeAgents(agents, threadId, fromAgent) {
+  const wakeable = agents.filter(a => a !== fromAgent && a !== 'system' && a !== 'connor' && AGENT_IDS[a]);
+  if (wakeable.length === 0) return;
+
+  const http = require('http');
+  const wakePromises = wakeable.map(agent => {
+    return new Promise((resolve) => {
+      const now = new Date(Date.now() + 5000).toISOString(); // 5 seconds from now
+      const body = JSON.stringify({
+        tool: 'cron',
+        args: {
+          action: 'add',
+          job: {
+            name: `comms-wake-${agent}-${Date.now()}`,
+            agentId: agent,
+            schedule: { kind: 'at', at: now },
+            sessionTarget: 'isolated',
+            payload: {
+              kind: 'agentTurn',
+              message: `You have a new message in Squad Comms thread #${threadId} from ${fromAgent}. Check your inbox and respond:\n~/clawd/bin/comms inbox --agent ${agent}\nRespond to any unread messages that need a reply using: ~/clawd/bin/comms send --from ${agent} --thread {id} --body "your reply" --no-wake\nUpdate your presence when done: ~/clawd/bin/comms presence --agent ${agent} --status idle`
+            },
+            delivery: { mode: 'none' },
+            enabled: true
+          }
+        }
+      });
+      const url = new URL(GATEWAY_URL + '/tools/invoke');
+      const req = http.request({
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          ...(GATEWAY_TOKEN ? { 'Authorization': `Bearer ${GATEWAY_TOKEN}` } : {})
+        },
+        timeout: 10000
+      }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          try { resolve({ agent, ok: JSON.parse(data).ok !== false }); }
+          catch { resolve({ agent, ok: false }); }
+        });
+      });
+      req.on('error', () => resolve({ agent, ok: false }));
+      req.on('timeout', () => { req.destroy(); resolve({ agent, ok: false }); });
+      req.write(body);
+      req.end();
+    });
+  });
+
+  const results = await Promise.all(wakePromises);
+  const woken = results.filter(r => r.ok).map(r => r.agent);
+  if (woken.length > 0) {
+    process.stderr.write(`Woke agents: ${woken.join(', ')}\n`);
+  }
+  return woken;
 }
 
 function error(msg) {
@@ -170,8 +241,16 @@ function cmdSend(flags) {
   // Auto-add sender as member if not already
   db.prepare('INSERT OR IGNORE INTO thread_members (thread_id, agent) VALUES (?, ?)').run(Number(flags.thread), flags.from);
 
+  // Get thread members for waking
+  const members = db.prepare('SELECT agent FROM thread_members WHERE thread_id = ?').all(Number(flags.thread)).map(r => r.agent);
+
   db.close();
   output(true, { message_id: result.lastInsertRowid, thread_id: Number(flags.thread), created_at: new Date().toISOString() }, `Sent message #${result.lastInsertRowid} to thread #${flags.thread}`);
+
+  // Wake agents unless --no-wake is set
+  if (!flags['no-wake']) {
+    wakeAgents(members, Number(flags.thread), flags.from).catch(() => {});
+  }
 }
 
 function cmdNewThread(flags) {
@@ -202,6 +281,11 @@ function cmdNewThread(flags) {
 
   db.close();
   output(true, { thread_id: threadId, title: flags.title, channel: channel, members: agents, task_id: flags.task || null }, `Created thread #${threadId}: ${flags.title}`);
+
+  // Wake agents unless --no-wake is set
+  if (!flags['no-wake']) {
+    wakeAgents(agents, threadId, flags.from).catch(() => {});
+  }
 }
 
 function cmdInbox(flags) {
