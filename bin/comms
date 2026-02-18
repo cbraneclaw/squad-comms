@@ -20,6 +20,32 @@ function getDb() {
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // Migration: add 'paused' to threads status if not already supported
+  try {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='threads'").get();
+    if (schema && schema.sql && !schema.sql.includes("'paused'")) {
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE threads_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          channel_id TEXT NOT NULL DEFAULT 'general',
+          task_id TEXT,
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved', 'blocked', 'archived', 'paused')),
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (channel_id) REFERENCES channels(id)
+        );
+        INSERT INTO threads_new SELECT * FROM threads;
+        DROP TABLE threads;
+        ALTER TABLE threads_new RENAME TO threads;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+    }
+  } catch (e) { /* table may not exist yet */ }
   return db;
 }
 
@@ -138,7 +164,7 @@ function cmdInit() {
       title TEXT NOT NULL,
       channel_id TEXT NOT NULL DEFAULT 'general',
       task_id TEXT,
-      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved', 'blocked', 'archived')),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved', 'blocked', 'archived', 'paused')),
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -230,11 +256,16 @@ function cmdSend(flags) {
   validateAgent(flags.from);
 
   const db = getDb();
-  const thread = db.prepare('SELECT id FROM threads WHERE id = ?').get(Number(flags.thread));
+  const thread = db.prepare('SELECT id, status FROM threads WHERE id = ?').get(Number(flags.thread));
   if (!thread) error(`Thread ${flags.thread} not found. Use "comms threads" to list threads.`);
+  if (thread.status === 'paused') {
+    db.close();
+    error(`Thread is paused. Resume it first with: comms thread resume ${flags.thread}`);
+  }
 
   const importance = flags.importance || 'normal';
-  const result = db.prepare('INSERT INTO messages (thread_id, from_agent, body, importance) VALUES (?, ?, ?, ?)').run(Number(flags.thread), flags.from, flags.body, importance);
+  const metadata = flags.session ? JSON.stringify({ session_id: flags.session }) : null;
+  const result = db.prepare('INSERT INTO messages (thread_id, from_agent, body, importance, metadata) VALUES (?, ?, ?, ?, ?)').run(Number(flags.thread), flags.from, flags.body, importance, metadata);
   db.prepare('UPDATE threads SET updated_at = datetime(\'now\') WHERE id = ?').run(Number(flags.thread));
   db.prepare('UPDATE agent_presence SET last_seen = datetime(\'now\'), last_thread_id = ? WHERE agent = ?').run(Number(flags.thread), flags.from);
 
@@ -334,7 +365,46 @@ function cmdInbox(flags) {
   output(true, { messages, count: messages.length }, `${messages.length} message(s) for ${flags.agent}`);
 }
 
+function cmdThreadPause(flags) {
+  const threadId = Number(flags._[0]);
+  if (!threadId) error('Thread ID is required. Usage: comms thread pause <id>');
+  const db = getDb();
+  const thread = db.prepare('SELECT id FROM threads WHERE id = ?').get(threadId);
+  if (!thread) error(`Thread ${threadId} not found.`);
+  db.prepare("UPDATE threads SET status = 'paused', updated_at = datetime('now') WHERE id = ?").run(threadId);
+  db.close();
+  output(true, { thread_id: threadId, status: 'paused' }, `Thread #${threadId} paused.`);
+}
+
+function cmdThreadResume(flags) {
+  const threadId = Number(flags._[0]);
+  if (!threadId) error('Thread ID is required. Usage: comms thread resume <id>');
+  const db = getDb();
+  const thread = db.prepare('SELECT id FROM threads WHERE id = ?').get(threadId);
+  if (!thread) error(`Thread ${threadId} not found.`);
+  db.prepare("UPDATE threads SET status = 'active', updated_at = datetime('now') WHERE id = ?").run(threadId);
+  db.close();
+  output(true, { thread_id: threadId, status: 'active' }, `Thread #${threadId} resumed.`);
+}
+
+function cmdThreadList() {
+  const db = getDb();
+  const threads = db.prepare(`
+    SELECT t.id, t.title, t.channel_id, t.status, t.created_by, t.updated_at,
+      (SELECT COUNT(*) FROM messages m WHERE m.thread_id = t.id) as message_count
+    FROM threads t ORDER BY t.updated_at DESC
+  `).all();
+  db.close();
+  const lines = threads.map(t => `#${t.id} [${t.status}] ${t.title} (${t.channel_id}, ${t.message_count} msgs)`).join('\n');
+  output(true, { threads, count: threads.length }, `${threads.length} thread(s):\n${lines}`);
+}
+
 function cmdThread(flags) {
+  const subCmd = flags._[0];
+  if (subCmd === 'pause') { flags._ = flags._.slice(1); return cmdThreadPause(flags); }
+  if (subCmd === 'resume') { flags._ = flags._.slice(1); return cmdThreadResume(flags); }
+  if (subCmd === 'list') { return cmdThreadList(); }
+
   const threadId = Number(flags._[0]);
   if (!threadId) error('Thread ID is required. Usage: comms thread <id>');
 
