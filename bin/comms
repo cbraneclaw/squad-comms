@@ -1,0 +1,449 @@
+#!/usr/bin/env node
+
+const Database = require(require('path').join(__dirname, '..', 'node_modules', 'better-sqlite3'));
+const path = require('path');
+const os = require('os');
+
+const DB_PATH = path.join(os.homedir(), 'clawd', 'comms.db');
+const VALID_AGENTS = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter', 'connor'];
+
+function getDb() {
+  const db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  return db;
+}
+
+function parseArgs(args) {
+  const result = { _: [] };
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith('--')) {
+      const key = args[i].slice(2);
+      if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
+        result[key] = args[i + 1];
+        i++;
+      } else {
+        result[key] = true;
+      }
+    } else {
+      result._.push(args[i]);
+    }
+  }
+  return result;
+}
+
+function output(ok, data, summary) {
+  console.log(JSON.stringify({ ok, data, summary }));
+  if (summary) process.stderr.write(summary + '\n');
+}
+
+function error(msg) {
+  console.log(JSON.stringify({ ok: false, error: msg }));
+  process.stderr.write('Error: ' + msg + '\n');
+  process.exit(1);
+}
+
+function validateAgent(agent) {
+  if (!VALID_AGENTS.includes(agent)) {
+    error(`Invalid agent "${agent}". Valid agents: ${VALID_AGENTS.join(', ')}`);
+  }
+}
+
+// ---- COMMANDS ----
+
+function cmdInit() {
+  const db = getDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS channels (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      type TEXT NOT NULL CHECK(type IN ('public', 'dm', 'thread')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS threads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      channel_id TEXT NOT NULL DEFAULT 'general',
+      task_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved', 'blocked', 'archived')),
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (channel_id) REFERENCES channels(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS thread_members (
+      thread_id INTEGER NOT NULL,
+      agent TEXT NOT NULL,
+      joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (thread_id, agent),
+      FOREIGN KEY (thread_id) REFERENCES threads(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id INTEGER NOT NULL,
+      from_agent TEXT NOT NULL,
+      body TEXT NOT NULL,
+      importance TEXT NOT NULL DEFAULT 'normal' CHECK(importance IN ('low', 'normal', 'high', 'urgent')),
+      metadata TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (thread_id) REFERENCES threads(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS read_receipts (
+      message_id INTEGER NOT NULL,
+      agent TEXT NOT NULL,
+      read_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (message_id, agent),
+      FOREIGN KEY (message_id) REFERENCES messages(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_presence (
+      agent TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'idle' CHECK(status IN ('idle', 'working', 'checking-comms', 'offline')),
+      last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      current_task TEXT,
+      last_thread_id INTEGER
+    );
+  `);
+
+  // FTS - create only if not exists
+  try {
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(body, content=messages, content_rowid=id);`);
+  } catch (e) {
+    // already exists
+  }
+
+  // Triggers
+  const triggers = [
+    { name: 'messages_ai', sql: `CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;` },
+    { name: 'messages_ad', sql: `CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body); END;` },
+    { name: 'messages_au', sql: `CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body); INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body); END;` },
+  ];
+  for (const t of triggers) {
+    try { db.exec(t.sql); } catch (e) { /* already exists */ }
+  }
+
+  // Seed channels
+  const insertChannel = db.prepare(`INSERT OR IGNORE INTO channels (id, name, description, type) VALUES (?, ?, ?, ?)`);
+  const channels = [
+    ['general', '#general', 'Team-wide announcements and coordination', 'public'],
+    ['handoffs', '#handoffs', 'Task handoffs between agents', 'public'],
+    ['urgent', '#urgent', 'Time-sensitive items needing immediate attention', 'public'],
+    ['status', '#status', 'Status updates and check-ins', 'public'],
+    ['ralph-devin', 'Ralph <> Devin', 'Direct messages', 'dm'],
+    ['ralph-orion', 'Ralph <> Orion', 'Direct messages', 'dm'],
+    ['ralph-scout', 'Ralph <> Scout', 'Direct messages', 'dm'],
+    ['ralph-quinn', 'Ralph <> Quinn', 'Direct messages', 'dm'],
+    ['ralph-porter', 'Ralph <> Porter', 'Direct messages', 'dm'],
+  ];
+  for (const c of channels) insertChannel.run(...c);
+
+  // Seed agent presence
+  const insertPresence = db.prepare(`INSERT OR IGNORE INTO agent_presence (agent, status, last_seen) VALUES (?, 'idle', datetime('now'))`);
+  for (const a of ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter']) {
+    insertPresence.run(a);
+  }
+
+  db.close();
+  output(true, { database: DB_PATH }, 'Database initialized and seeded successfully.');
+}
+
+function cmdSend(flags) {
+  if (!flags.from) error('--from is required');
+  if (!flags.thread) error('--thread is required');
+  if (!flags.body) error('--body is required');
+  validateAgent(flags.from);
+
+  const db = getDb();
+  const thread = db.prepare('SELECT id FROM threads WHERE id = ?').get(Number(flags.thread));
+  if (!thread) error(`Thread ${flags.thread} not found. Use "comms threads" to list threads.`);
+
+  const importance = flags.importance || 'normal';
+  const result = db.prepare('INSERT INTO messages (thread_id, from_agent, body, importance) VALUES (?, ?, ?, ?)').run(Number(flags.thread), flags.from, flags.body, importance);
+  db.prepare('UPDATE threads SET updated_at = datetime(\'now\') WHERE id = ?').run(Number(flags.thread));
+  db.prepare('UPDATE agent_presence SET last_seen = datetime(\'now\'), last_thread_id = ? WHERE agent = ?').run(Number(flags.thread), flags.from);
+
+  // Auto-add sender as member if not already
+  db.prepare('INSERT OR IGNORE INTO thread_members (thread_id, agent) VALUES (?, ?)').run(Number(flags.thread), flags.from);
+
+  db.close();
+  output(true, { message_id: result.lastInsertRowid, thread_id: Number(flags.thread), created_at: new Date().toISOString() }, `Sent message #${result.lastInsertRowid} to thread #${flags.thread}`);
+}
+
+function cmdNewThread(flags) {
+  if (!flags.title) error('--title is required');
+  if (!flags.from) error('--from is required');
+  validateAgent(flags.from);
+
+  const channel = flags.channel || 'general';
+  const db = getDb();
+
+  const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(channel);
+  if (!ch) error(`Channel "${channel}" not found.`);
+
+  const result = db.prepare('INSERT INTO threads (title, channel_id, task_id, created_by) VALUES (?, ?, ?, ?)').run(flags.title, channel, flags.task || null, flags.from);
+  const threadId = result.lastInsertRowid;
+
+  // Add members
+  const agents = flags.agents ? flags.agents.split(',').map(a => a.trim()) : [];
+  if (!agents.includes(flags.from)) agents.push(flags.from);
+  const insertMember = db.prepare('INSERT OR IGNORE INTO thread_members (thread_id, agent) VALUES (?, ?)');
+  for (const a of agents) {
+    validateAgent(a);
+    insertMember.run(threadId, a);
+  }
+
+  // System message
+  db.prepare('INSERT INTO messages (thread_id, from_agent, body, importance) VALUES (?, ?, ?, ?)').run(threadId, 'system', `[${flags.from} created thread: ${flags.title}]`, 'low');
+
+  db.close();
+  output(true, { thread_id: threadId, title: flags.title, channel: channel, members: agents, task_id: flags.task || null }, `Created thread #${threadId}: ${flags.title}`);
+}
+
+function cmdInbox(flags) {
+  if (!flags.agent) error('--agent is required');
+  validateAgent(flags.agent);
+
+  const limit = Number(flags.limit) || 50;
+  const db = getDb();
+
+  let query;
+  if (flags.all) {
+    query = db.prepare(`
+      SELECT m.*, t.title as thread_title, t.channel_id, t.status as thread_status
+      FROM messages m
+      JOIN threads t ON m.thread_id = t.id
+      JOIN thread_members tm ON tm.thread_id = t.id AND tm.agent = ?
+      WHERE m.from_agent != ?
+      ORDER BY m.created_at DESC
+      LIMIT ?
+    `);
+  } else {
+    query = db.prepare(`
+      SELECT m.*, t.title as thread_title, t.channel_id, t.status as thread_status
+      FROM messages m
+      JOIN threads t ON m.thread_id = t.id
+      JOIN thread_members tm ON tm.thread_id = t.id AND tm.agent = ?
+      WHERE m.from_agent != ?
+        AND m.from_agent != 'system'
+        AND NOT EXISTS (SELECT 1 FROM read_receipts rr WHERE rr.message_id = m.id AND rr.agent = ?)
+      ORDER BY m.created_at DESC
+      LIMIT ?
+    `);
+  }
+
+  const messages = flags.all
+    ? query.all(flags.agent, flags.agent, limit)
+    : query.all(flags.agent, flags.agent, flags.agent, limit);
+
+  // Mark as read
+  const markRead = db.prepare('INSERT OR IGNORE INTO read_receipts (message_id, agent) VALUES (?, ?)');
+  for (const m of messages) markRead.run(m.id, flags.agent);
+
+  db.prepare('UPDATE agent_presence SET last_seen = datetime(\'now\'), status = \'checking-comms\' WHERE agent = ?').run(flags.agent);
+
+  db.close();
+  output(true, { messages, count: messages.length }, `${messages.length} message(s) for ${flags.agent}`);
+}
+
+function cmdThread(flags) {
+  const threadId = Number(flags._[0]);
+  if (!threadId) error('Thread ID is required. Usage: comms thread <id>');
+
+  const limit = Number(flags.limit) || 100;
+  const offset = Number(flags.offset) || 0;
+  const db = getDb();
+
+  const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(threadId);
+  if (!thread) error(`Thread ${threadId} not found.`);
+
+  const members = db.prepare('SELECT agent FROM thread_members WHERE thread_id = ?').all(threadId).map(r => r.agent);
+  const messages = db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?').all(threadId, limit, offset);
+
+  db.close();
+  output(true, { thread: { ...thread, members }, messages }, `Thread #${threadId}: ${thread.title} (${messages.length} messages)`);
+}
+
+function cmdThreads(flags) {
+  if (!flags.agent) error('--agent is required');
+  validateAgent(flags.agent);
+
+  const db = getDb();
+  let conditions = ['tm.agent = ?'];
+  let params = [flags.agent];
+
+  if (flags.status) {
+    conditions.push('t.status = ?');
+    params.push(flags.status);
+  }
+  if (flags.channel) {
+    conditions.push('t.channel_id = ?');
+    params.push(flags.channel);
+  }
+
+  const threads = db.prepare(`
+    SELECT t.*,
+      (SELECT COUNT(*) FROM messages m WHERE m.thread_id = t.id
+        AND m.from_agent != ? AND m.from_agent != 'system'
+        AND NOT EXISTS (SELECT 1 FROM read_receipts rr WHERE rr.message_id = m.id AND rr.agent = ?)) as unread_count,
+      (SELECT body FROM messages m2 WHERE m2.thread_id = t.id ORDER BY m2.created_at DESC LIMIT 1) as last_message
+    FROM threads t
+    JOIN thread_members tm ON tm.thread_id = t.id
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY t.updated_at DESC
+  `).all(flags.agent, flags.agent, ...params);
+
+  // Get members for each thread
+  const getMembersStmt = db.prepare('SELECT agent FROM thread_members WHERE thread_id = ?');
+  for (const t of threads) {
+    t.members = getMembersStmt.all(t.id).map(r => r.agent);
+  }
+
+  db.close();
+  output(true, { threads, count: threads.length }, `${threads.length} thread(s) for ${flags.agent}`);
+}
+
+function cmdUpdateThread(flags) {
+  const threadId = Number(flags._[0]);
+  if (!threadId) error('Thread ID is required. Usage: comms update-thread <id> [--status ...] [--add-agent ...] [--remove-agent ...]');
+
+  const db = getDb();
+  const thread = db.prepare('SELECT id FROM threads WHERE id = ?').get(threadId);
+  if (!thread) error(`Thread ${threadId} not found.`);
+
+  if (flags.status) {
+    db.prepare('UPDATE threads SET status = ?, updated_at = datetime(\'now\') WHERE id = ?').run(flags.status, threadId);
+  }
+  if (flags['add-agent']) {
+    validateAgent(flags['add-agent']);
+    db.prepare('INSERT OR IGNORE INTO thread_members (thread_id, agent) VALUES (?, ?)').run(threadId, flags['add-agent']);
+  }
+  if (flags['remove-agent']) {
+    db.prepare('DELETE FROM thread_members WHERE thread_id = ? AND agent = ?').run(threadId, flags['remove-agent']);
+  }
+
+  const updated = db.prepare('SELECT * FROM threads WHERE id = ?').get(threadId);
+  const members = db.prepare('SELECT agent FROM thread_members WHERE thread_id = ?').all(threadId).map(r => r.agent);
+
+  db.close();
+  output(true, { thread: { ...updated, members } }, `Updated thread #${threadId}`);
+}
+
+function cmdPresence(flags) {
+  const db = getDb();
+
+  if (flags.all) {
+    const agents = db.prepare('SELECT * FROM agent_presence ORDER BY agent').all();
+    db.close();
+    output(true, { agents }, `${agents.length} agents`);
+    return;
+  }
+
+  if (!flags.agent) error('--agent or --all is required');
+  validateAgent(flags.agent);
+
+  if (flags.status || flags.task) {
+    const updates = [];
+    const params = [];
+    if (flags.status) { updates.push('status = ?'); params.push(flags.status); }
+    if (flags.task) { updates.push('current_task = ?'); params.push(flags.task); }
+    updates.push("last_seen = datetime('now')");
+    params.push(flags.agent);
+    db.prepare(`UPDATE agent_presence SET ${updates.join(', ')} WHERE agent = ?`).run(...params);
+  }
+
+  const agent = db.prepare('SELECT * FROM agent_presence WHERE agent = ?').get(flags.agent);
+  db.close();
+  output(true, { agent }, `Presence for ${flags.agent}: ${agent?.status || 'unknown'}`);
+}
+
+function cmdSearch(flags) {
+  const query = flags._[0];
+  if (!query) error('Search query is required. Usage: comms search "query"');
+
+  const limit = Number(flags.limit) || 20;
+  const db = getDb();
+
+  let sql = `
+    SELECT m.*, t.title as thread_title, t.channel_id
+    FROM messages_fts fts
+    JOIN messages m ON m.id = fts.rowid
+    JOIN threads t ON t.id = m.thread_id
+    WHERE messages_fts MATCH ?
+  `;
+  const params = [query];
+
+  if (flags.agent) {
+    sql += ' AND m.from_agent = ?';
+    params.push(flags.agent);
+  }
+  sql += ' ORDER BY m.created_at DESC LIMIT ?';
+  params.push(limit);
+
+  const results = db.prepare(sql).all(...params);
+  db.close();
+  output(true, { results, count: results.length }, `${results.length} result(s) for "${query}"`);
+}
+
+function cmdStats() {
+  const db = getDb();
+
+  const totalThreads = db.prepare('SELECT COUNT(*) as count FROM threads').get().count;
+  const activeThreads = db.prepare("SELECT COUNT(*) as count FROM threads WHERE status = 'active'").get().count;
+  const totalMessages = db.prepare('SELECT COUNT(*) as count FROM messages').get().count;
+  const messagesToday = db.prepare("SELECT COUNT(*) as count FROM messages WHERE created_at >= date('now')").get().count;
+
+  // Unread per agent
+  const agents = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter'];
+  const unreadPerAgent = {};
+  const unreadStmt = db.prepare(`
+    SELECT COUNT(*) as count FROM messages m
+    JOIN thread_members tm ON tm.thread_id = m.thread_id AND tm.agent = ?
+    WHERE m.from_agent != ? AND m.from_agent != 'system'
+      AND NOT EXISTS (SELECT 1 FROM read_receipts rr WHERE rr.message_id = m.id AND rr.agent = ?)
+  `);
+  for (const a of agents) {
+    unreadPerAgent[a] = unreadStmt.get(a, a, a).count;
+  }
+
+  const presence = db.prepare('SELECT * FROM agent_presence ORDER BY agent').all();
+
+  db.close();
+  output(true, {
+    total_threads: totalThreads,
+    active_threads: activeThreads,
+    total_messages: totalMessages,
+    messages_today: messagesToday,
+    unread_per_agent: unreadPerAgent,
+    agent_presence: presence,
+  }, `Stats: ${totalThreads} threads, ${totalMessages} messages, ${messagesToday} today`);
+}
+
+// ---- MAIN ----
+const args = process.argv.slice(2);
+const command = args[0];
+const flags = parseArgs(args.slice(1));
+
+switch (command) {
+  case 'init': cmdInit(); break;
+  case 'send': cmdSend(flags); break;
+  case 'new-thread': cmdNewThread(flags); break;
+  case 'inbox': cmdInbox(flags); break;
+  case 'thread': cmdThread(flags); break;
+  case 'threads': cmdThreads(flags); break;
+  case 'update-thread': cmdUpdateThread(flags); break;
+  case 'presence': cmdPresence(flags); break;
+  case 'search': cmdSearch(flags); break;
+  case 'stats': cmdStats(); break;
+  default:
+    console.log(JSON.stringify({
+      ok: false,
+      error: `Unknown command: ${command || '(none)'}`,
+      usage: 'comms <init|send|new-thread|inbox|thread|threads|update-thread|presence|search|stats>'
+    }));
+    process.exit(1);
+}
