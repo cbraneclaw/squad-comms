@@ -295,8 +295,41 @@ function cmdNewThread(flags) {
   const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(channel);
   if (!ch) error(`Channel "${channel}" not found.`);
 
-  const result = db.prepare('INSERT INTO threads (title, channel_id, task_id, created_by) VALUES (?, ?, ?, ?)').run(flags.title, channel, flags.task || null, flags.from);
+  // Auto-create Beads task unless --no-task or --task is provided
+  let taskId = flags.task || null;
+  if (!taskId && !flags['no-task']) {
+    try {
+      const BR_PATH = '/Users/connorraney/.local/bin/br';
+      const { execSync } = require('child_process');
+      // Determine assignee from agents list (first non-ralph agent, or ralph)
+      const agents = flags.agents ? flags.agents.split(',').map(a => a.trim()) : [flags.from];
+      const assignee = agents.find(a => a !== 'ralph' && a !== 'connor') || flags.from;
+      const priority = flags.priority || '2';
+      const labels = [channel, 'squad-comms'].join(',');
+      const brResult = execSync(
+        `${BR_PATH} create "${flags.title}" -a ${assignee} -p ${priority} -l "${labels}" --due "+7d"`,
+        { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 }
+      );
+      const match = brResult.match(/Created (bd-\w+)/);
+      if (match) taskId = match[1];
+    } catch (e) {
+      // Non-fatal: thread still gets created without a task
+      process.stderr.write(`Warning: Could not auto-create Beads task: ${e.message}\n`);
+    }
+  }
+
+  const result = db.prepare('INSERT INTO threads (title, channel_id, task_id, created_by) VALUES (?, ?, ?, ?)').run(flags.title, channel, taskId, flags.from);
   const threadId = result.lastInsertRowid;
+
+  // If we created a task, update its description to link to the thread
+  if (taskId && !flags.task) {
+    try {
+      const BR_PATH = '/Users/connorraney/.local/bin/br';
+      const { execSync } = require('child_process');
+      execSync(`${BR_PATH} update ${taskId} --description "Squad Comms Thread #${threadId}. ${flags.title}"`,
+        { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 });
+    } catch (e) { /* non-fatal */ }
+  }
 
   // Add members
   const agents = flags.agents ? flags.agents.split(',').map(a => a.trim()) : [];
@@ -311,12 +344,58 @@ function cmdNewThread(flags) {
   db.prepare('INSERT INTO messages (thread_id, from_agent, body, importance) VALUES (?, ?, ?, ?)').run(threadId, 'system', `[${flags.from} created thread: ${flags.title}]`, 'low');
 
   db.close();
-  output(true, { thread_id: threadId, title: flags.title, channel: channel, members: agents, task_id: flags.task || null }, `Created thread #${threadId}: ${flags.title}`);
+  output(true, { thread_id: threadId, title: flags.title, channel: channel, members: agents, task_id: taskId }, `Created thread #${threadId}: ${flags.title}${taskId ? ` (Beads: ${taskId})` : ''}`);
 
   // Wake agents unless --no-wake is set
   if (!flags['no-wake']) {
     wakeAgents(agents, threadId, flags.from).catch(() => {});
   }
+}
+
+function cmdSyncTasks() {
+  // Find threads without linked Beads tasks and create them
+  const db = getDb();
+  const orphanThreads = db.prepare(`
+    SELECT t.*, GROUP_CONCAT(tm.agent) as members_str
+    FROM threads t
+    LEFT JOIN thread_members tm ON tm.thread_id = t.id
+    WHERE t.task_id IS NULL AND t.status IN ('active', 'blocked')
+    GROUP BY t.id
+  `).all();
+
+  if (orphanThreads.length === 0) {
+    db.close();
+    output(true, { synced: 0 }, 'All threads have linked tasks. Nothing to sync.');
+    return;
+  }
+
+  const BR_PATH = '/Users/connorraney/.local/bin/br';
+  const { execSync } = require('child_process');
+  const synced = [];
+
+  for (const t of orphanThreads) {
+    try {
+      const members = t.members_str ? t.members_str.split(',') : ['ralph'];
+      const assignee = members.find(a => a !== 'ralph' && a !== 'connor' && a !== 'system') || 'ralph';
+      const brResult = execSync(
+        `${BR_PATH} create "${t.title}" -a ${assignee} -p 2 -l "${t.channel_id},squad-comms" --due "+7d"`,
+        { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 }
+      );
+      const match = brResult.match(/Created (bd-\w+)/);
+      if (match) {
+        const taskId = match[1];
+        db.prepare('UPDATE threads SET task_id = ?, updated_at = datetime(\'now\') WHERE id = ?').run(taskId, t.id);
+        execSync(`${BR_PATH} update ${taskId} --description "Squad Comms Thread #${t.id}. ${t.title}"`,
+          { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 });
+        synced.push({ thread_id: t.id, title: t.title, task_id: taskId });
+      }
+    } catch (e) {
+      process.stderr.write(`Warning: Failed to create task for thread #${t.id}: ${e.message}\n`);
+    }
+  }
+
+  db.close();
+  output(true, { synced: synced.length, details: synced }, `Synced ${synced.length} thread(s) with new Beads tasks`);
 }
 
 function cmdInbox(flags) {
@@ -593,6 +672,7 @@ switch (command) {
   case 'presence': cmdPresence(flags); break;
   case 'search': cmdSearch(flags); break;
   case 'stats': cmdStats(); break;
+  case 'sync-tasks': cmdSyncTasks(); break;
   default:
     console.log(JSON.stringify({
       ok: false,
