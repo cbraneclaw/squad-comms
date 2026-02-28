@@ -5,7 +5,7 @@ const path = require('path');
 const os = require('os');
 
 const DB_PATH = path.join(os.homedir(), 'clawd', 'comms.db');
-const VALID_AGENTS = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter', 'connor'];
+const VALID_AGENTS = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter', 'cluma', 'connor'];
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || (() => {
   try {
@@ -14,11 +14,11 @@ const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || (() => {
     return match ? match[1].trim() : '';
   } catch { return ''; }
 })();
-const AGENT_IDS = { orion: 'orion', devin: 'devin', scout: 'scout', quinn: 'quinn', porter: 'porter' };
-const ALL_AGENTS = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter'];
+const AGENT_IDS = { orion: 'orion', devin: 'devin', scout: 'scout', quinn: 'quinn', porter: 'porter', cluma: 'cluma' };
+const ALL_AGENTS = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter', 'cluma'];
 
 function extractMentions(body) {
-  const mentionRegex = /@(ralph|orion|devin|scout|quinn|porter)\b/gi;
+  const mentionRegex = /@(ralph|orion|devin|scout|quinn|porter|cluma)\b/gi;
   const matches = body.match(mentionRegex) || [];
   return [...new Set(matches.map(m => m.slice(1).toLowerCase()))];
 }
@@ -366,38 +366,39 @@ function cmdNewThread(flags) {
   const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(channel);
   if (!ch) error(`Channel "${channel}" not found.`);
 
-  // Auto-create Beads task unless --no-task or --task is provided
+  // Auto-create Loop task unless --no-task or --task is provided
   let taskId = flags.task || null;
   if (!taskId && !flags['no-task']) {
     try {
-      const BR_PATH = '/Users/connorraney/.local/bin/br';
+      const LOOP_PATH = path.join(os.homedir(), 'clawd', 'scripts', 'loop');
       const { execSync } = require('child_process');
-      // Determine assignee from agents list (first non-ralph agent, or ralph)
       const agents = flags.agents ? flags.agents.split(',').map(a => a.trim()) : [flags.from];
       const assignee = agents.find(a => a !== 'ralph' && a !== 'connor') || flags.from;
-      const priority = flags.priority || '2';
+      const priorityMap = { '1': 'critical', '2': 'high', '3': 'medium' };
+      const priority = priorityMap[flags.priority] || 'high';
       const labels = [channel, 'squad-comms'].join(',');
-      const brResult = execSync(
-        `${BR_PATH} create "${flags.title}" -a ${assignee} -p ${priority} -l "${labels}" --due "+7d"`,
+      const loopResult = execSync(
+        `${LOOP_PATH} add "${flags.title}" --agentic --agent ${assignee} -P ${priority} --labels "${labels}"`,
         { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 }
       );
-      const match = brResult.match(/Created (bd-\w+)/);
-      if (match) taskId = match[1];
+      // loop add outputs the ID as last line
+      const lines = loopResult.trim().split('\n');
+      const lastLine = lines[lines.length - 1].trim();
+      if (/^\d+$/.test(lastLine)) taskId = lastLine;
     } catch (e) {
-      // Non-fatal: thread still gets created without a task
-      process.stderr.write(`Warning: Could not auto-create Beads task: ${e.message}\n`);
+      process.stderr.write(`Warning: Could not auto-create Loop task: ${e.message}\n`);
     }
   }
 
   const result = db.prepare('INSERT INTO threads (title, channel_id, task_id, created_by) VALUES (?, ?, ?, ?)').run(flags.title, channel, taskId, flags.from);
   const threadId = result.lastInsertRowid;
 
-  // If we created a task, update its description to link to the thread
+  // If we created a task, link it to the thread
   if (taskId && !flags.task) {
     try {
-      const BR_PATH = '/Users/connorraney/.local/bin/br';
+      const LOOP_PATH = path.join(os.homedir(), 'clawd', 'scripts', 'loop');
       const { execSync } = require('child_process');
-      execSync(`${BR_PATH} update ${taskId} --description "Squad Comms Thread #${threadId}. ${flags.title}"`,
+      execSync(`${LOOP_PATH} update ${taskId} --thread ${threadId} --notes "Squad Comms Thread #${threadId}. ${flags.title}"`,
         { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 });
     } catch (e) { /* non-fatal */ }
   }
@@ -415,7 +416,7 @@ function cmdNewThread(flags) {
   db.prepare('INSERT INTO messages (thread_id, from_agent, body, importance) VALUES (?, ?, ?, ?)').run(threadId, 'system', `[${flags.from} created thread: ${flags.title}]`, 'low');
 
   db.close();
-  output(true, { thread_id: threadId, title: flags.title, channel: channel, members: agents, task_id: taskId }, `Created thread #${threadId}: ${flags.title}${taskId ? ` (Beads: ${taskId})` : ''}`);
+  output(true, { thread_id: threadId, title: flags.title, channel: channel, members: agents, task_id: taskId }, `Created thread #${threadId}: ${flags.title}${taskId ? ` (Loop: #${taskId})` : ''}`);
 
   // Wake agents unless --no-wake is set
   if (!flags['no-wake']) {
@@ -424,7 +425,7 @@ function cmdNewThread(flags) {
 }
 
 function cmdSyncTasks() {
-  // Find threads without linked Beads tasks and create them
+  // Find threads without linked Loop tasks and create them
   const db = getDb();
   const orphanThreads = db.prepare(`
     SELECT t.*, GROUP_CONCAT(tm.agent) as members_str
@@ -440,7 +441,7 @@ function cmdSyncTasks() {
     return;
   }
 
-  const BR_PATH = '/Users/connorraney/.local/bin/br';
+  const LOOP_PATH = path.join(os.homedir(), 'clawd', 'scripts', 'loop');
   const { execSync } = require('child_process');
   const synced = [];
 
@@ -448,25 +449,24 @@ function cmdSyncTasks() {
     try {
       const members = t.members_str ? t.members_str.split(',') : ['ralph'];
       const assignee = members.find(a => a !== 'ralph' && a !== 'connor' && a !== 'system') || 'ralph';
-      const brResult = execSync(
-        `${BR_PATH} create "${t.title}" -a ${assignee} -p 2 -l "${t.channel_id},squad-comms" --due "+7d"`,
+      const loopResult = execSync(
+        `${LOOP_PATH} add "${t.title}" --agentic --agent ${assignee} -P high --labels "${t.channel_id},squad-comms" --thread ${t.id}`,
         { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 }
       );
-      const match = brResult.match(/Created (bd-\w+)/);
-      if (match) {
-        const taskId = match[1];
+      const lines = loopResult.trim().split('\n');
+      const lastLine = lines[lines.length - 1].trim();
+      if (/^\d+$/.test(lastLine)) {
+        const taskId = lastLine;
         db.prepare('UPDATE threads SET task_id = ?, updated_at = datetime(\'now\') WHERE id = ?').run(taskId, t.id);
-        execSync(`${BR_PATH} update ${taskId} --description "Squad Comms Thread #${t.id}. ${t.title}"`,
-          { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 });
         synced.push({ thread_id: t.id, title: t.title, task_id: taskId });
       }
     } catch (e) {
-      process.stderr.write(`Warning: Failed to create task for thread #${t.id}: ${e.message}\n`);
+      process.stderr.write(`Warning: Failed to create loop for thread #${t.id}: ${e.message}\n`);
     }
   }
 
   db.close();
-  output(true, { synced: synced.length, details: synced }, `Synced ${synced.length} thread(s) with new Beads tasks`);
+  output(true, { synced: synced.length, details: synced }, `Synced ${synced.length} thread(s) with new Loop tasks`);
 }
 
 function cmdInbox(flags) {
@@ -567,6 +567,19 @@ function cmdThread(flags) {
 
   const members = db.prepare('SELECT agent FROM thread_members WHERE thread_id = ?').all(threadId).map(r => r.agent);
   const messages = db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?').all(threadId, limit, offset);
+
+  // Attach attachment info to each message
+  const attStmt = db.prepare('SELECT id, filename, original_name, mime_type, size_bytes FROM attachments WHERE message_id = ?');
+  const ATTACHMENTS_DIR = path.join(os.homedir(), 'clawd', 'mission-control', 'data', 'attachments');
+  for (const msg of messages) {
+    const atts = attStmt.all(msg.id);
+    if (atts.length > 0) {
+      msg.attachments = atts.map(a => ({
+        ...a,
+        path: path.join(ATTACHMENTS_DIR, a.filename),
+      }));
+    }
+  }
 
   db.close();
   output(true, { thread: { ...thread, members }, messages }, `Thread #${threadId}: ${thread.title} (${messages.length} messages)`);
