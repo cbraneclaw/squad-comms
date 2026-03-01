@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
 const Database = require(require('path').join(__dirname, '..', 'node_modules', 'better-sqlite3'));
+const fs = require('fs');
+const crypto = require('crypto');
 const path = require('path');
 const os = require('os');
 
 const DB_PATH = path.join(os.homedir(), 'clawd', 'comms.db');
+const ATTACHMENTS_DIR = path.join(os.homedir(), 'clawd', 'data', 'attachments');
 const VALID_AGENTS = ['ralph', 'orion', 'devin', 'scout', 'quinn', 'porter', 'cluma', 'connor'];
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || (() => {
@@ -90,6 +93,11 @@ function getDb() {
       `);
     }
   } catch (e) { /* table may not exist yet */ }
+  
+  // Migration: ensure attachments table has path column
+  try {
+    db.exec("ALTER TABLE attachments ADD COLUMN path TEXT DEFAULT ''");
+  } catch (e) { /* column already exists */ }
   return db;
 }
 
@@ -342,6 +350,31 @@ function cmdSend(flags) {
 
   // Auto-add sender as member if not already
   db.prepare('INSERT OR IGNORE INTO thread_members (thread_id, agent) VALUES (?, ?)').run(Number(flags.thread), flags.from);
+
+  // Handle file attachment
+  if (flags.file) {
+    const filePath = path.resolve(flags.file);
+    if (!fs.existsSync(filePath)) {
+      db.close();
+      error('File not found: ' + flags.file);
+    }
+    const stat = fs.statSync(filePath);
+    const originalName = path.basename(filePath);
+    const ext = path.extname(originalName);
+    const hash = crypto.randomBytes(8).toString('hex');
+    const filename = hash + ext;
+    const mime = require('child_process').execSync('file --mime-type -b ' + JSON.stringify(filePath), { encoding: 'utf8' }).trim();
+
+    // Ensure attachments dir exists
+    fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+    const destPath = path.join(ATTACHMENTS_DIR, filename);
+    fs.copyFileSync(filePath, destPath);
+
+    db.prepare('INSERT INTO attachments (message_id, filename, original_name, mime_type, size_bytes, path) VALUES (?, ?, ?, ?, ?, ?)').run(
+      result.lastInsertRowid, filename, originalName, mime, stat.size, destPath
+    );
+  }
+
 
   // Get thread members for waking
   const members = db.prepare('SELECT agent FROM thread_members WHERE thread_id = ?').all(Number(flags.thread)).map(r => r.agent);
@@ -740,6 +773,28 @@ function cmdStats() {
   }, `Stats: ${totalThreads} threads, ${totalMessages} messages, ${messagesToday} today`);
 }
 
+
+function cmdAttachments(flags) {
+  const threadId = Number(flags.thread || flags._[0]);
+  if (!threadId) error('--thread or thread ID is required. Usage: comms attachments --thread <id>');
+
+  const db = getDb();
+  const thread = db.prepare('SELECT id, title FROM threads WHERE id = ?').get(threadId);
+  if (!thread) error('Thread ' + threadId + ' not found.');
+
+  const attachments = db.prepare(`
+    SELECT a.*, m.from_agent, m.created_at as message_date
+    FROM attachments a
+    JOIN messages m ON m.id = a.message_id
+    WHERE m.thread_id = ?
+    ORDER BY a.created_at DESC
+  `).all(threadId);
+
+  db.close();
+  const lines = attachments.map(a => a.original_name + ' (' + a.mime_type + ', ' + a.size_bytes + ' bytes) from ' + a.from_agent).join('\n');
+  output(true, { attachments, count: attachments.length, thread_id: threadId }, attachments.length + ' attachment(s) in thread #' + threadId + (lines ? ':\n' + lines : ''));
+}
+
 // ---- MAIN ----
 const args = process.argv.slice(2);
 const command = args[0];
@@ -756,12 +811,13 @@ switch (command) {
   case 'presence': cmdPresence(flags); break;
   case 'search': cmdSearch(flags); break;
   case 'stats': cmdStats(); break;
+  case 'attachments': cmdAttachments(flags); break;
   case 'sync-tasks': cmdSyncTasks(); break;
   default:
     console.log(JSON.stringify({
       ok: false,
       error: `Unknown command: ${command || '(none)'}`,
-      usage: 'comms <init|send|new-thread|inbox|thread|threads|update-thread|presence|search|stats>'
+      usage: 'comms <init|send|new-thread|inbox|thread|threads|update-thread|presence|search|stats|attachments>'
     }));
     process.exit(1);
 }
