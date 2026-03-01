@@ -90,6 +90,9 @@ function getDb() {
       `);
     }
   } catch (e) { /* table may not exist yet */ }
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS thread_loops (thread_id INTEGER NOT NULL, loop_id INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime("now")), created_by TEXT NOT NULL DEFAULT "system", UNIQUE(thread_id, loop_id), FOREIGN KEY (thread_id) REFERENCES threads(id))');
+  } catch(e) { /* already exists */ }
   return db;
 }
 
@@ -250,6 +253,15 @@ function cmdInit() {
       FOREIGN KEY (thread_id) REFERENCES threads(id)
     );
 
+    CREATE TABLE IF NOT EXISTS thread_loops (
+      thread_id INTEGER NOT NULL,
+      loop_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_by TEXT NOT NULL DEFAULT 'system',
+      UNIQUE(thread_id, loop_id),
+      FOREIGN KEY (thread_id) REFERENCES threads(id)
+    );
+
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       thread_id INTEGER NOT NULL,
@@ -366,42 +378,13 @@ function cmdNewThread(flags) {
   const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(channel);
   if (!ch) error(`Channel "${channel}" not found.`);
 
-  // Auto-create Loop task unless --no-task or --task is provided
-  let taskId = flags.task || null;
-  if (!taskId && !flags['no-task']) {
-    try {
-      const LOOP_PATH = path.join(os.homedir(), 'clawd', 'scripts', 'loop');
-      const { execSync } = require('child_process');
-      const agents = flags.agents ? flags.agents.split(',').map(a => a.trim()) : [flags.from];
-      const assignee = agents.find(a => a !== 'ralph' && a !== 'connor') || flags.from;
-      const priorityMap = { '1': 'critical', '2': 'high', '3': 'medium' };
-      const priority = priorityMap[flags.priority] || 'high';
-      const labels = [channel, 'squad-comms'].join(',');
-      const loopResult = execSync(
-        `${LOOP_PATH} add "${flags.title}" --agentic --agent ${assignee} -P ${priority} --labels "${labels}"`,
-        { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 }
-      );
-      // loop add outputs the ID as last line
-      const lines = loopResult.trim().split('\n');
-      const lastLine = lines[lines.length - 1].trim();
-      if (/^\d+$/.test(lastLine)) taskId = lastLine;
-    } catch (e) {
-      process.stderr.write(`Warning: Could not auto-create Loop task: ${e.message}\n`);
-    }
-  }
+  // Threads no longer auto-create tasks (Loops v2: thread-task decoupling)
+  const taskId = null;
 
   const result = db.prepare('INSERT INTO threads (title, channel_id, task_id, created_by) VALUES (?, ?, ?, ?)').run(flags.title, channel, taskId, flags.from);
   const threadId = result.lastInsertRowid;
 
-  // If we created a task, link it to the thread
-  if (taskId && !flags.task) {
-    try {
-      const LOOP_PATH = path.join(os.homedir(), 'clawd', 'scripts', 'loop');
-      const { execSync } = require('child_process');
-      execSync(`${LOOP_PATH} update ${taskId} --thread ${threadId} --notes "Squad Comms Thread #${threadId}. ${flags.title}"`,
-        { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 });
-    } catch (e) { /* non-fatal */ }
-  }
+  // Legacy auto-task block removed in Loops v2
 
   // Add members
   const agents = flags.agents ? flags.agents.split(',').map(a => a.trim()) : [];
@@ -425,48 +408,42 @@ function cmdNewThread(flags) {
 }
 
 function cmdSyncTasks() {
-  // Find threads without linked Loop tasks and create them
+  // Loops v2: Migrate old thread.task_id relationships into thread_loops junction table
   const db = getDb();
-  const orphanThreads = db.prepare(`
-    SELECT t.*, GROUP_CONCAT(tm.agent) as members_str
-    FROM threads t
-    LEFT JOIN thread_members tm ON tm.thread_id = t.id
-    WHERE t.task_id IS NULL AND t.status IN ('active', 'blocked')
-    GROUP BY t.id
-  `).all();
+  const fs = require('fs');
+  const yaml = require(require('path').join(__dirname, '..', 'node_modules', 'js-yaml') || 'js-yaml');
+  const LOOPS_FILE = path.join(os.homedir(), 'clawd', 'loops.yaml');
+  let synced = 0;
 
-  if (orphanThreads.length === 0) {
-    db.close();
-    output(true, { synced: 0 }, 'All threads have linked tasks. Nothing to sync.');
-    return;
-  }
-
-  const LOOP_PATH = path.join(os.homedir(), 'clawd', 'scripts', 'loop');
-  const { execSync } = require('child_process');
-  const synced = [];
-
-  for (const t of orphanThreads) {
+  // Strategy 1: Migrate threads that have a task_id set (old 1:1 relationship)
+  const threadsWithTaskId = db.prepare("SELECT id, task_id FROM threads WHERE task_id IS NOT NULL").all();
+  for (const t of threadsWithTaskId) {
     try {
-      const members = t.members_str ? t.members_str.split(',') : ['ralph'];
-      const assignee = members.find(a => a !== 'ralph' && a !== 'connor' && a !== 'system') || 'ralph';
-      const loopResult = execSync(
-        `${LOOP_PATH} add "${t.title}" --agentic --agent ${assignee} -P high --labels "${t.channel_id},squad-comms" --thread ${t.id}`,
-        { cwd: path.join(os.homedir(), 'clawd'), encoding: 'utf8', timeout: 10000 }
-      );
-      const lines = loopResult.trim().split('\n');
-      const lastLine = lines[lines.length - 1].trim();
-      if (/^\d+$/.test(lastLine)) {
-        const taskId = lastLine;
-        db.prepare('UPDATE threads SET task_id = ?, updated_at = datetime(\'now\') WHERE id = ?').run(taskId, t.id);
-        synced.push({ thread_id: t.id, title: t.title, task_id: taskId });
-      }
-    } catch (e) {
-      process.stderr.write(`Warning: Failed to create loop for thread #${t.id}: ${e.message}\n`);
-    }
+      db.prepare('INSERT OR IGNORE INTO thread_loops (thread_id, loop_id, created_by) VALUES (?, ?, ?)').run(t.id, Number(t.task_id), 'sync-migration');
+      synced++;
+    } catch (e) { /* ignore duplicates */ }
   }
 
+  // Strategy 2: Read loops.yaml and find loops with a thread field
+  try {
+    const raw = fs.readFileSync(LOOPS_FILE, 'utf-8');
+    const data = yaml.load(raw);
+    const allTasks = [...(data?.tasks || []), ...(data?.done || [])];
+    for (const task of allTasks) {
+      if (task.thread) {
+        try {
+          db.prepare('INSERT OR IGNORE INTO thread_loops (thread_id, loop_id, created_by) VALUES (?, ?, ?)').run(Number(task.thread), task.id, 'sync-migration');
+          synced++;
+        } catch (e) { /* ignore */ }
+      }
+    }
+  } catch (e) {
+    process.stderr.write(`Warning: Could not read loops.yaml: ${e.message}\n`);
+  }
+
+  const totalLinks = db.prepare('SELECT COUNT(*) as count FROM thread_loops').get().count;
   db.close();
-  output(true, { synced: synced.length, details: synced }, `Synced ${synced.length} thread(s) with new Loop tasks`);
+  output(true, { synced, total_links: totalLinks }, `Synced ${synced} link(s) into thread_loops table (${totalLinks} total links)`);
 }
 
 function cmdInbox(flags) {
@@ -740,6 +717,92 @@ function cmdStats() {
   }, `Stats: ${totalThreads} threads, ${totalMessages} messages, ${messagesToday} today`);
 }
 
+
+function cmdLinkLoop(flags) {
+  if (!flags.thread) error('--thread is required');
+  if (!flags['loop-id']) error('--loop-id is required');
+  if (!flags.from) error('--from is required');
+  validateAgent(flags.from);
+
+  const db = getDb();
+  const thread = db.prepare('SELECT id FROM threads WHERE id = ?').get(Number(flags.thread));
+  if (!thread) error(`Thread ${flags.thread} not found.`);
+
+  try {
+    db.prepare('INSERT INTO thread_loops (thread_id, loop_id, created_by) VALUES (?, ?, ?)').run(Number(flags.thread), Number(flags['loop-id']), flags.from);
+  } catch (e) {
+    if (e.message && e.message.includes('UNIQUE')) {
+      db.close();
+      output(true, { thread_id: Number(flags.thread), loop_id: Number(flags['loop-id']), already_linked: true }, `Loop #${flags['loop-id']} already linked to thread #${flags.thread}`);
+      return;
+    }
+    db.close();
+    error(`Failed to link: ${e.message}`);
+  }
+
+  db.close();
+  output(true, { thread_id: Number(flags.thread), loop_id: Number(flags['loop-id']) }, `Linked loop #${flags['loop-id']} to thread #${flags.thread}`);
+}
+
+function cmdUnlinkLoop(flags) {
+  if (!flags.thread) error('--thread is required');
+  if (!flags['loop-id']) error('--loop-id is required');
+
+  const db = getDb();
+  const result = db.prepare('DELETE FROM thread_loops WHERE thread_id = ? AND loop_id = ?').run(Number(flags.thread), Number(flags['loop-id']));
+  db.close();
+
+  if (result.changes === 0) {
+    output(true, { removed: false }, `No link found between loop #${flags['loop-id']} and thread #${flags.thread}`);
+  } else {
+    output(true, { removed: true, thread_id: Number(flags.thread), loop_id: Number(flags['loop-id']) }, `Unlinked loop #${flags['loop-id']} from thread #${flags.thread}`);
+  }
+}
+
+function cmdThreadLoops(flags) {
+  const threadId = Number(flags._[0]);
+  if (!threadId) error('Thread ID is required. Usage: comms thread-loops <id>');
+
+  const db = getDb();
+  const thread = db.prepare('SELECT id, title FROM threads WHERE id = ?').get(threadId);
+  if (!thread) error(`Thread ${threadId} not found.`);
+
+  const links = db.prepare('SELECT * FROM thread_loops WHERE thread_id = ? ORDER BY created_at').all(threadId);
+  db.close();
+
+  // Read loops.yaml to enrich with status
+  const fs = require('fs');
+  let yaml;
+  try { yaml = require(require('path').join(__dirname, '..', 'node_modules', 'js-yaml')); } catch(e) { yaml = require('js-yaml'); }
+  const LOOPS_FILE = path.join(os.homedir(), 'clawd', 'loops.yaml');
+  let allTasks = [];
+  try {
+    const raw = fs.readFileSync(LOOPS_FILE, 'utf-8');
+    const data = yaml.load(raw);
+    allTasks = [...(data?.tasks || []), ...(data?.done || [])];
+  } catch (e) { /* can't read loops */ }
+
+  const enriched = links.map(link => {
+    const loop = allTasks.find(t => t.id === link.loop_id);
+    return {
+      loop_id: link.loop_id,
+      thread_id: link.thread_id,
+      created_by: link.created_by,
+      created_at: link.created_at,
+      title: loop ? loop.title : '(unknown)',
+      status: loop ? loop.status : 'unknown',
+      priority: loop ? loop.priority : 'unknown',
+      agent: loop ? (loop.agent || '') : '',
+    };
+  });
+
+  const statusIcons = { pending: '⏸️', in_progress: '▶️', blocked: '🚫', done: '✅' };
+  const lines = enriched.map(l => `${statusIcons[l.status] || '❓'} Loop #${l.loop_id}: ${l.title} [${l.status}] ${l.agent ? '(@' + l.agent + ')' : ''}`);
+  const summary = `Thread #${threadId} "${thread.title}" - ${enriched.length} linked loop(s):\n${lines.join('\n') || '(none)'}`;
+
+  output(true, { thread_id: threadId, thread_title: thread.title, loops: enriched }, summary);
+}
+
 // ---- MAIN ----
 const args = process.argv.slice(2);
 const command = args[0];
@@ -757,11 +820,14 @@ switch (command) {
   case 'search': cmdSearch(flags); break;
   case 'stats': cmdStats(); break;
   case 'sync-tasks': cmdSyncTasks(); break;
+  case 'link-loop': cmdLinkLoop(flags); break;
+  case 'unlink-loop': cmdUnlinkLoop(flags); break;
+  case 'thread-loops': cmdThreadLoops(flags); break;
   default:
     console.log(JSON.stringify({
       ok: false,
       error: `Unknown command: ${command || '(none)'}`,
-      usage: 'comms <init|send|new-thread|inbox|thread|threads|update-thread|presence|search|stats>'
+      usage: 'comms <init|send|new-thread|inbox|thread|threads|update-thread|presence|search|stats|sync-tasks|link-loop|unlink-loop|thread-loops>'
     }));
     process.exit(1);
 }
